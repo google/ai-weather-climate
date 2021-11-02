@@ -148,7 +148,7 @@ def sanity_check_integrated_gradients(integrated_gradients: np.ndarray,
 def get_integrated_gradients(
     input_img: Union[tf.Tensor, np.ndarray],
     model: tf.keras.Model,
-    label: Optional[tf.Tensor] = None,
+    label: Optional[Union[tf.Tensor, np.ndarray]] = None,
     mask: Optional[tf.Tensor] = None,
     baseline: Optional[np.ndarray] = None,
     num_steps: int = 50,
@@ -232,7 +232,7 @@ def get_integrated_gradients(
 def get_integrated_gradients_with_retry(
     input_img: Union[tf.Tensor, np.ndarray],
     model: tf.keras.Model,
-    label: Optional[tf.Tensor] = None,
+    label: Optional[Union[tf.Tensor, np.ndarray]] = None,
     mask: Optional[tf.Tensor] = None,
     baseline: Optional[np.ndarray] = None,
     retry_times: int = 3,
