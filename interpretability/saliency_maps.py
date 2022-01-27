@@ -237,9 +237,10 @@ def get_integrated_gradients_with_retry(
     baseline: Optional[np.ndarray] = None,
     retry_times: int = 3,
     gradient_base: str = 'prediction',
-    is_classification: bool = True) -> Optional[tf.Tensor]:
+    is_classification: bool = True,
+    num_steps: int = 50,
+  ) -> Optional[tf.Tensor]:
   """Returns sanity checked IG by doubling the number of steps in each retry."""
-  num_steps = 50
   for _ in range(retry_times):
     ig = get_integrated_gradients(
         input_img=input_img,
