@@ -1,4 +1,3 @@
-# Lint as: python3
 """Techniques for determining the saliency of input features."""
 
 import logging
