@@ -242,7 +242,7 @@ def create_train_step(
 def train(model: flax.linen.Module, loss_fn: Callable, metrics_fn: Callable,
           learning_rate: float, train_ds: tf.data.Dataset,
           test_ds: tf.data.Dataset, model_dir: str,
-          num_train_steps: int) -> TrainState:
+          num_train_steps: int, update_freq: int = 10) -> TrainState:
 
   def get_p_train_step(optimizer):
     return jax.pmap(
@@ -260,10 +260,15 @@ def train(model: flax.linen.Module, loss_fn: Callable, metrics_fn: Callable,
       num_train_steps=num_train_steps)
 
 
-def train_custom(model_init_fn: Callable, get_p_train_step: Callable,
-                 eval_loop_fn: Callable, learning_rate: float,
-                 train_ds: tf.data.Dataset, test_ds: tf.data.Dataset,
-                 model_dir: str, num_train_steps: int) -> TrainState:
+def train_custom(model_init_fn: Callable,
+                 get_p_train_step: Callable,
+                 eval_loop_fn: Callable,
+                 learning_rate: float,
+                 train_ds: tf.data.Dataset,
+                 test_ds: tf.data.Dataset,
+                 model_dir: str,
+                 num_train_steps: int,
+                 update_freq: int = 10) -> TrainState:
   """Trains model on train_ds and evaluates it on test_ds."""
   last_checkpoint_step = None
 
@@ -293,7 +298,7 @@ def train_custom(model_init_fn: Callable, get_p_train_step: Callable,
     for batch in train_ds:
       batch_size = get_batch_size(batch)
       batch = shard_to_devices(batch)
-      if last_checkpoint_step != state.step and state.step % 10 == 0:
+      if last_checkpoint_step != state.step and state.step % update_freq == 0:
         train_timer.stop()
         eval_timer = _Timer()
         metrics = eval_loop_fn(rep_state, test_ds)
