@@ -257,7 +257,8 @@ def train(model: flax.linen.Module, loss_fn: Callable, metrics_fn: Callable,
       train_ds=train_ds,
       test_ds=test_ds,
       model_dir=model_dir,
-      num_train_steps=num_train_steps)
+      num_train_steps=num_train_steps,
+      update_freq=update_freq)
 
 
 def train_custom(model_init_fn: Callable,
