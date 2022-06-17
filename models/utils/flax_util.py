@@ -1,4 +1,6 @@
 """Train and eval loops for flax and a some flax helpers."""
+import dataclasses
+import functools
 import json
 import logging
 import os
@@ -107,8 +109,12 @@ def init_train_state(
   params = model_init_fn(sample)
   optimizer = optax.adam(learning_rate=learning_rate)
   opt_state = optimizer.init(params)
-  state = TrainState(step=0, opt_state=opt_state, params=params,
-                     step_rng=jax.random.PRNGKey(1), loss=None)
+  state = TrainState(
+      step=0,
+      opt_state=opt_state,
+      params=params,
+      step_rng=jax.random.PRNGKey(1),
+      loss=None)
   rep_state = flax.jax_utils.replicate(state)
   metrics = eval_loop_fn(rep_state, sample_ds.take(1))
   checkpoint_template = Checkpoint(metrics=metrics, state=state)
@@ -131,8 +137,7 @@ def restore_checkpoint(model_dir: str, model: flax.linen.Module,
                        sample_ds: tf.data.Dataset) -> TrainState:
   """Restores TrainState from last checkpoint in model_dir."""
   return restore_checkpoint_custom(
-      model_dir,
-      default_model_init(model),
+      model_dir, default_model_init(model),
       lambda state, ds: eval_loop(model.apply, metrics_fn, state, ds),
       sample_ds)
 
@@ -153,12 +158,20 @@ def restore_checkpoint_custom(model_dir: str, model_init_fn: Callable,
   return train_state
 
 
-def get_batch_size(batch) -> int:
+def get_num_floats_in_batch(batch) -> int:
   if isinstance(batch, dict):
-    return sum(get_batch_size(v) for v in batch.values())
+    return sum(get_num_floats_in_batch(v) for v in batch.values())
   elif isinstance(batch, tuple):
-    return sum(get_batch_size(v) for v in batch)
+    return sum(get_num_floats_in_batch(v) for v in batch)
   return np.prod(batch.shape)
+
+
+def get_num_samples_in_batch(batch) -> int:
+  if isinstance(batch, dict):
+    return get_num_samples_in_batch(next(iter(batch.values())))
+  elif isinstance(batch, tuple):
+    return get_num_samples_in_batch(next(iter(batch)))
+  return batch.shape[0]
 
 
 def shard_to_devices(sample):
@@ -239,26 +252,90 @@ def create_train_step(
   return jax.jit(f)
 
 
-def train(model: flax.linen.Module, loss_fn: Callable, metrics_fn: Callable,
-          learning_rate: float, train_ds: tf.data.Dataset,
-          test_ds: tf.data.Dataset, model_dir: str,
-          num_train_steps: int, update_freq: int = 10) -> TrainState:
+def train(model: flax.linen.Module,
+          loss_fn: Callable,
+          metrics_fn: Callable,
+          learning_rate: float,
+          train_ds: tf.data.Dataset,
+          test_ds: tf.data.Dataset,
+          model_dir: str,
+          num_train_steps: int,
+          metrics_update_secs: int = 60) -> TrainState:
+  """Trains model; uses the default initializer and eval loop in the process."""
 
   def get_p_train_step(optimizer):
     return jax.pmap(
         create_train_step(model.apply, loss_fn, optimizer), axis_name='batch')
 
+  # pylint: disable=g-long-lambda
   return train_custom(
       model_init_fn=default_model_init(model),
       get_p_train_step=get_p_train_step,
-      eval_loop_fn=lambda state, ds: eval_loop(
-          model.apply, metrics_fn, state, ds),
+      eval_loop_fn=lambda state, ds: eval_loop(model.apply, metrics_fn, state,
+                                               ds),
       learning_rate=learning_rate,
       train_ds=train_ds,
       test_ds=test_ds,
       model_dir=model_dir,
       num_train_steps=num_train_steps,
-      update_freq=update_freq)
+      metrics_update_secs=metrics_update_secs)
+
+
+_AVG_TRAIN_LOSS = 'average train loss'
+
+
+@dataclasses.dataclass
+class PerfCounters:
+  """Counters tracking training performance."""
+  batch_count: int = 0
+  sample_count: int = 0
+  sample_size_bytes: int = 0
+  train_loss_total: float = 0
+
+  def to_dict(self, duration_sec: float):
+    if self.batch_count == 0 or duration_sec == 0:
+      return {}
+    return {
+        'data rate (Mfloat/s)':
+            (self.sample_size_bytes / 1024**2 / duration_sec),
+        # 'samples per batch' is the number of samples in a batch
+        # averaged over some training steps (e.g., the epoch or between
+        # evals). Note that normally every batch has the same number of
+        # samples, so the average will not vary over time.
+        'samples per batch': (self.sample_count / self.batch_count),
+        'sample rate (1/sec)': (self.sample_count / duration_sec),
+        _AVG_TRAIN_LOSS: (self.train_loss_total / self.batch_count),
+    }
+
+  def add(self, other: 'PerfCounters'):
+    self.batch_count += other.batch_count
+    self.sample_count += other.sample_count
+    self.sample_size_bytes += other.sample_size_bytes
+    self.train_loss_total += other.train_loss_total
+
+
+def _update_metrics(state: TrainState, model_dir: str,
+                    summary_writer: tensorboard.SummaryWriter,
+                    eval_loop_fn: Callable, update_metrics_timer: _Timer,
+                    perf_counters: PerfCounters, should_save_checkpoint: bool):
+  """Runs eval, updates tensorboard, and saves state to a checkpoint."""
+  eval_timer = _Timer()
+  eval_metrics = eval_loop_fn()
+  eval_timer.stop()
+  secs_since_last = update_metrics_timer.get_elapsed_time()
+  update_metrics_timer.reset()
+
+  eval_duration_ratio = eval_timer.get_elapsed_time() / secs_since_last
+
+  summary_writer.scalar('eval/eval time %', eval_duration_ratio * 100,
+                        state.step)
+  write_dict_to_tensorboard('eval/', eval_metrics, state.step, summary_writer)
+  if should_save_checkpoint:
+    save_checkpoint(state, eval_metrics, model_dir)
+
+  perf_metrics_dict = perf_counters.to_dict(secs_since_last)
+  write_dict_to_tensorboard('train/', perf_metrics_dict, state.step,
+                            summary_writer)
 
 
 def train_custom(model_init_fn: Callable,
@@ -269,7 +346,7 @@ def train_custom(model_init_fn: Callable,
                  test_ds: tf.data.Dataset,
                  model_dir: str,
                  num_train_steps: int,
-                 update_freq: int = 10) -> TrainState:
+                 metrics_update_secs: float = 60) -> TrainState:
   """Trains model on train_ds and evaluates it on test_ds."""
   last_checkpoint_step = None
 
@@ -293,45 +370,58 @@ def train_custom(model_init_fn: Callable,
 
   p_train_step = get_p_train_step(optimizer)
 
-  train_timer = _Timer()
+  update_metrics_timer = _Timer()
+  train_perf_counters = PerfCounters()
   while state.step < num_train_steps:
     log('Starting epoch.')
+    epoch_timer = _Timer()
+    epoch_perf_counters = PerfCounters()
     for batch in train_ds:
-      batch_size = get_batch_size(batch)
-      batch = shard_to_devices(batch)
-      if last_checkpoint_step != state.step and state.step % update_freq == 0:
-        train_timer.stop()
-        eval_timer = _Timer()
-        metrics = eval_loop_fn(rep_state, test_ds)
-        summary_writer.scalar('perf/eval duration (s)',
-                              eval_timer.get_elapsed_time(), state.step)
-        write_dict_to_tensorboard('eval/', metrics, state.step, summary_writer)
-        save_checkpoint(state, metrics, model_dir)
+      device_batch = shard_to_devices(batch)
+      if update_metrics_timer.get_elapsed_time() > metrics_update_secs:
+        _update_metrics(
+            state,
+            model_dir,
+            summary_writer,
+            functools.partial(eval_loop_fn, rep_state, test_ds),
+            update_metrics_timer,
+            train_perf_counters,
+            should_save_checkpoint=last_checkpoint_step != state.step)
         last_checkpoint_step = state.step
-        train_timer.start()
-      rep_state = p_train_step(rep_state, batch)
+        train_perf_counters = PerfCounters()
+
+      rep_state = p_train_step(rep_state, device_batch)
       _, step_rng = jax.random.split(rep_state.step_rng[0], 2)
       rep_state = rep_state.replace(
-          step_rng=jnp.tile(step_rng[None, :],
-                            (rep_state.step_rng.shape[0], 1)))
+          step_rng=jnp.tile(step_rng[None, :], (rep_state.step_rng.shape[0],
+                                                1)))
       state = flax.jax_utils.unreplicate(rep_state)
-      summary_writer.scalar('loss', state.loss, state.step)
-      summary_writer.scalar(
-          'perf/training data rate (Mfloat/s)',
-          batch_size / 1024**2 / train_timer.get_elapsed_time(), state.step)
-      summary_writer.scalar('perf/training step rate (1/sec)',
-                            1 / train_timer.get_elapsed_time(), state.step)
-      train_timer.reset()
-      log('Step: %s, loss: %s', state.step, state.loss)
       if jnp.isnan(state.loss):
         raise ValueError(f'Loss is nan at step {state.step}!')
+      batch_counters = PerfCounters(
+          batch_count=1,
+          sample_size_bytes=get_num_floats_in_batch(batch),
+          sample_count=get_num_samples_in_batch(batch),
+          train_loss_total=state.loss)
+      train_perf_counters.add(batch_counters)
+      epoch_perf_counters.add(batch_counters)
       if state.step >= num_train_steps:
         break
-  metrics = eval_loop_fn(rep_state, test_ds)
-  if last_checkpoint_step != state.step:
-    write_dict_to_tensorboard('eval/', metrics, state.step, summary_writer)
-    save_checkpoint(state, metrics, model_dir)
-
+    epoch_perf_metrics_dict = epoch_perf_counters.to_dict(
+        update_metrics_timer.get_elapsed_time())
+    write_dict_to_tensorboard('epoch/', epoch_perf_metrics_dict, state.step,
+                              summary_writer)
+    epoch_timer.reset()
+    log('Average batch loss in epoch: %.2f after %d steps',
+        epoch_perf_metrics_dict[_AVG_TRAIN_LOSS], state.step)
+  _update_metrics(
+      state,
+      model_dir,
+      summary_writer,
+      functools.partial(eval_loop_fn, rep_state, test_ds),
+      update_metrics_timer,
+      train_perf_counters,
+      should_save_checkpoint=last_checkpoint_step != state.step)
   summary_writer.close()
   return state
 
