@@ -129,7 +129,8 @@ def init_train_state(
 
 
 def default_model_init(model):
-  return lambda sample: model.init(jax.random.PRNGKey(1), sample, train=True)
+  rng = jax.random.PRNGKey(1)
+  return lambda sample: jax.jit(model.init)(rng, sample, train=True)
 
 
 def restore_checkpoint(model_dir: str, model: flax.linen.Module,
