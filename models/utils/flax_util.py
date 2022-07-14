@@ -221,7 +221,7 @@ def eval_loop(apply_fn: Callable, metrics_fn: Callable, state: TrainState,
 
   # Transpose from list[dict[metric_name, batch_mean]] to
   # dict[metric_name, list[batch_mean]].
-  eval_metrics = jax.tree_multimap(lambda *x: jnp.stack(x), *eval_metrics)
+  eval_metrics = jax.tree_map(lambda *x: jnp.stack(x), *eval_metrics)
 
   # Compute mean over the dataset.
   metrics = jax.tree_map(lambda x: float(jnp.mean(x)), eval_metrics)
